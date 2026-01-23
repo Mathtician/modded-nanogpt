@@ -1054,7 +1054,7 @@ class Block(nn.Module):
         if self.attn is not None:
             x = x + self.attn(norm(x), attn_args, qkvo_w)
         if self.mlp is not None:
-            mlp_lambda = 0.5
+            mlp_lambda = 0.75
             # Interpolation may prevent dead gradients, may be unnecessary (see MLP init)
             x = mlp_lambda * x + (1.0 - mlp_lambda) * self.mlp(norm(x), c_fc, c_proj)
         return x
@@ -1152,7 +1152,8 @@ class GPT(nn.Module):
             self.mlp_bank[:, 0, :half_hdim, :].uniform_(-mlp_bound, mlp_bound)  # c_fc
             # Can orthogonalize if needed for stability,
             # but even with mlp_gamma = 0, L^infty(Jacobian product across 11 layers) < 3 (usually)
-            self.mlp_bank[:, 0, half_hdim:, :].neg_(self.mlp_bank[:, 0, :half_hdim, :])
+            self.mlp_bank[:, 0, half_hdim:, :].copy_(self.mlp_bank[:, 0, :half_hdim, :])
+            self.mlp_bank[:, 0, half_hdim:, :].neg_()
             self.mlp_bank[:, 1, :, :].copy_(self.mlp_bank[:, 0, :, :])  # c_proj
 
         # Create blocks with has_attn/has_mlp flags
