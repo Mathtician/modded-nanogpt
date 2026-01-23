@@ -1033,9 +1033,7 @@ class MLP(nn.Module):
         # Weights are stored in parameter banks and passed via forward()
 
     def forward(self, x: Tensor, c_fc: Tensor, c_proj: Tensor):
-        # relu(x)^2:
-        # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
+        # Fused triton kernel for relu(x @ W1.T) @ W2.T
         return FusedLinearReLUFunction.apply(x, c_fc, c_proj)
 
 class Block(nn.Module):
@@ -1056,7 +1054,9 @@ class Block(nn.Module):
         if self.attn is not None:
             x = x + self.attn(norm(x), attn_args, qkvo_w)
         if self.mlp is not None:
-            x = x + self.mlp(norm(x), c_fc, c_proj)
+            mlp_lambda = 0.5
+            # Interpolation may prevent dead gradients, may be unnecessary (see MLP init)
+            x = mlp_lambda * x + (1.0 - mlp_lambda) * self.mlp(norm(x), c_fc, c_proj)
         return x
 
 # -----------------------------------------------------------------------------
@@ -1135,18 +1135,25 @@ class GPT(nn.Module):
         self.mlp_bank.reshape = (num_mlp_with_padding * 2, mlp_hdim, model_dim)  # (24, 3072, 768)
 
         # improved init scale by @YouJiacheng
-        # Attention uses dim^-0.5, MLP uses 0.5 * dim^-0.5
+        # Attention uses dim^-0.5
         attn_std = model_dim ** -0.5
         attn_bound = (3 ** 0.5) * attn_std
-        mlp_std = 0.5 * (model_dim ** -0.5)
+        # (Near-)identity init for MLP layer by @Mathtician
+        # Requires activation function f such that f(x) - f(-x) = x
+        # Works for ReLU, GELU, SiLU, but not ReLU^2
+        half_hdim = mlp_hdim // 2
+        mlp_std = half_hdim ** -0.5
         mlp_bound = (3 ** 0.5) * mlp_std
         with torch.no_grad():
             # Init attention bank (QKV uniform, O zero)
             self.attn_bank[:, :model_dim * 3, :].uniform_(-attn_bound, attn_bound)
             self.attn_bank[:, model_dim * 3:, :].zero_()
-            # Init MLP bank (c_fc uniform, c_proj zero) 
-            self.mlp_bank[:, 0, :, :].uniform_(-mlp_bound, mlp_bound)  # c_fc
-            self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
+            # Init MLP bank (c_fc = vstack(U, -U) where U^T U ~ I, c_proj = c_fc)
+            self.mlp_bank[:, 0, :half_hdim, :].uniform_(-mlp_bound, mlp_bound)  # c_fc
+            # Can orthogonalize if needed for stability,
+            # but even with mlp_gamma = 0, L^infty(Jacobian product across 11 layers) < 3 (usually)
+            self.mlp_bank[:, 0, half_hdim:, :].neg_(self.mlp_bank[:, 0, :half_hdim, :])
+            self.mlp_bank[:, 1, :, :].copy_(self.mlp_bank[:, 0, :, :])  # c_proj
 
         # Create blocks with has_attn/has_mlp flags
         self.paired_head_layers = [0, 2, 5, 9]
