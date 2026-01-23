@@ -254,10 +254,10 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     return out
 
 # -----------------------------------------------------------------------------
-# Triton kernel for MLP: relu(x @ W1.T)^2, by @andrewbriand, @jrauvola
+# Triton kernel for MLP: relu(x @ W1.T), by @andrewbriand, @jrauvola
 
 @triton.jit
-def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
+def linear_relu_kernel(a_desc, b_desc, c_desc, aux_desc,
                                  M, N, K,
                                  BLOCK_SIZE_M: tl.constexpr,
                                  BLOCK_SIZE_N: tl.constexpr,
@@ -302,29 +302,31 @@ def linear_relu_square_kernel(a_desc, b_desc, c_desc, aux_desc,
         c0 = acc0.to(dtype)
         if not FORWARD:
             c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
-            c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
+            # c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
+            c0 = tl.where(c0_pre > 0, c0, 0)
 
         c_desc.store([offs_am_c, offs_bn_c], c0)
 
         if FORWARD:
             c0_post = tl.maximum(c0, 0)
-            c0_post = c0_post * c0_post
+            # c0_post = c0_post * c0_post
             aux_desc.store([offs_am_c, offs_bn_c], c0_post)
 
         c1 = acc1.to(dtype)
         if not FORWARD:
             c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+            # c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
+            c1 = tl.where(c1_pre > 0, c1, 0)
 
         c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
 
         if FORWARD:
             c1_post = tl.maximum(c1, 0)
-            c1_post = c1_post * c1_post
+            # c1_post = c1_post * c1_post
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 
-def linear_relu_square(a, b, aux=None):
+def linear_relu(a, b, aux=None):
     M, K = a.shape
     N, K = b.shape
     dtype = a.dtype
@@ -355,7 +357,7 @@ def linear_relu_square(a, b, aux=None):
             triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
         ), )
 
-    linear_relu_square_kernel[grid](
+    linear_relu_kernel[grid](
         a_desc, b_desc, c_desc, aux_desc,
         M, N, K,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
@@ -373,10 +375,10 @@ def linear_relu_square(a, b, aux=None):
     else:
         return c
 
-class FusedLinearReLUSquareFunction(torch.autograd.Function):
+class FusedLinearReLUFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, W1, W2):
-        pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
+        pre, post = linear_relu(x.view((-1, x.shape[-1])), W1)
         x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
         return x3.view(x.shape)
@@ -385,7 +387,7 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         x, W1, W2, pre, post = ctx.saved_tensors
         dW2 = post.T @ grad_output
-        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
+        dpre = linear_relu(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
         dW1 = dpre.T @ x
         dx = dpre @ W1
         return dx.view(x.shape), dW1, dW2

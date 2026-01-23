@@ -34,7 +34,8 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
+# from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
+from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUFunction, FusedSoftcappedCrossEntropy
 
 dynamo.config.recompile_limit = 64
 
@@ -1035,7 +1036,7 @@ class MLP(nn.Module):
         # relu(x)^2:
         # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
-        return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
+        return FusedLinearReLUFunction.apply(x, c_fc, c_proj)
 
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool):
