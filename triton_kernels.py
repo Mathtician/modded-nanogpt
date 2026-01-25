@@ -302,27 +302,36 @@ def linear_relu_kernel(a_desc, b_desc, c_desc, aux_desc,
         c0 = acc0.to(dtype)
         if not FORWARD:
             c0_pre = aux_desc.load([offs_am_c, offs_bn_c])
-            # c0 = 2 * c0 * tl.where(c0_pre > 0, c0_pre, 0)
-            c0 = tl.where(c0_pre > 0, c0, 0)
+            meow = tl.where(c0_pre < 0,
+                               tl.where(c0_pre < -1, -1, (4+3*c0_pre)*c0_pre),
+                               tl.where(c0_pre < 1, (4-3*c0_pre)*c0_pre, 1))
+            c0 = 0.5 * (meow + 1) * c0
 
         c_desc.store([offs_am_c, offs_bn_c], c0)
 
         if FORWARD:
-            c0_post = tl.maximum(c0, 0)
-            # c0_post = c0_post * c0_post
+            c0_post = tl.where(c0 < 0,
+                               tl.where(c0 < -1, -1, (2+c0)*c0),
+                               tl.where(c0 < 1, (2-c0)*c0, 1))
+            c0_post = 0.5 * (c0_post + 1) * c0
             aux_desc.store([offs_am_c, offs_bn_c], c0_post)
 
         c1 = acc1.to(dtype)
         if not FORWARD:
             c1_pre = aux_desc.load([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2])
-            # c1 = 2 * c1 * tl.where(c1_pre > 0, c1_pre, 0)
-            c1 = tl.where(c1_pre > 0, c1, 0)
+            meow = tl.where(c1_pre < 0,
+                               tl.where(c1_pre < -1, -1, (4+3*c1_pre)*c1_pre),
+                               tl.where(c1_pre < 1, (4-3*c1_pre)*c1_pre, 1))
+            c1 = 1.5 * (meow + 1) * c1
+
 
         c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
 
         if FORWARD:
-            c1_post = tl.maximum(c1, 0)
-            # c1_post = c1_post * c1_post
+            c1_post = tl.where(c1 < 0,
+                               tl.where(c1 < -1, -1, (2+c1)*c1),
+                               tl.where(c1 < 1, (2-c1)*c1, 1))
+            c1_post = 0.5 * (c1_post + 1) * c1
             aux_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1_post)
 
 
