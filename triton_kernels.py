@@ -322,7 +322,7 @@ def linear_relu_kernel(a_desc, b_desc, c_desc, aux_desc,
             meow = tl.where(c1_pre < 0,
                                tl.where(c1_pre < -1, -1, (4+3*c1_pre)*c1_pre),
                                tl.where(c1_pre < 1, (4-3*c1_pre)*c1_pre, 1))
-            c1 = 1.5 * (meow + 1) * c1
+            c1 = 0.5 * (meow + 1) * c1
 
 
         c_desc.store([offs_am_c, offs_bn_c + BLOCK_SIZE_N // 2], c1)
