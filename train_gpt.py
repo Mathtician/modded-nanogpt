@@ -1149,12 +1149,8 @@ class GPT(nn.Module):
             self.attn_bank[:, :model_dim * 3, :].uniform_(-attn_bound, attn_bound)
             self.attn_bank[:, model_dim * 3:, :].zero_()
             # Init MLP bank (c_fc = vstack(U, -U) where U^T U ~ I, c_proj = c_fc)
-            U = torch.empty(half_hdim, model_dim)
-            U.uniform_(-mlp_bound, mlp_bound)
-            U *= 0.5
-            for _ in range(5):
-                UTU = U.T @ U
-                U = U @ ((15/8) * torch.eye(model_dim) - (5/4) * UTU + (3/8) * UTU @ UTU)
+            U = torch.randn((half_hdim, model_dim))
+            U, _ = torch.linalg.qr(U)
             self.mlp_bank[:, 0, :half_hdim, :].copy_(U)  # c_fc
             # Can orthogonalize if needed for stability,
             # but even with mlp_gamma = 0, L^infty(Jacobian product across 11 layers) < 3 (usually)
