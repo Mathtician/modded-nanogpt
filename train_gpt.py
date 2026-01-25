@@ -1054,10 +1054,9 @@ class Block(nn.Module):
         if self.attn is not None:
             x = x + self.attn(norm(x), attn_args, qkvo_w)
         if self.mlp is not None:
-            # mlp_lambda = 0.75
+            mlp_lambda = 0.75
             # Interpolation may prevent dead gradients, may be unnecessary (see MLP init)
-            # x = mlp_lambda * x + (1.0 - mlp_lambda) * self.mlp(norm(x), c_fc, c_proj)
-            x = self.mlp(norm(x), c_fc, c_proj)
+            x = mlp_lambda * x + (1.0 - mlp_lambda) * self.mlp(norm(x), c_fc, c_proj)
         return x
 
 # -----------------------------------------------------------------------------
