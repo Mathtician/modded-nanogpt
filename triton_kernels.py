@@ -483,7 +483,7 @@ def cproj_block_diag_dweight_kernel(
     for _ in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
         post = tl.load(post_ptrs, mask=(offs_k[:, None] < M) & (offs_m[None, :] < CPROJ_BLOCK_IN), other=0.0)
         gout = tl.load(g_ptrs, mask=(offs_k[:, None] < M) & (offs_n[None, :] < CPROJ_BLOCK_OUT), other=0.0)
-        acc += tl.dot(post, gout)
+        acc += tl.dot(post.T, gout)  # post is (K, M); transpose to (M, K) to match gout (K, N)
         post_ptrs += BLOCK_SIZE_K * stride_pm
         g_ptrs += BLOCK_SIZE_K * stride_gm
         offs_k += BLOCK_SIZE_K
