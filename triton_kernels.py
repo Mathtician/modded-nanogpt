@@ -539,7 +539,7 @@ def cproj_block_diag_dweight(post: torch.Tensor, grad_out: torch.Tensor) -> torc
     return dw
 
 def _assert_cproj_offblock_nan(tensor: torch.Tensor, name: str):
-    if not CPROJ_ASSERT:
+    if not CPROJ_ASSERT or torch._dynamo.is_compiling():
         return
     with torch.no_grad():
         for b in range(NUM_CPROJ_BLOCKS):
@@ -555,7 +555,7 @@ def _assert_cproj_offblock_nan(tensor: torch.Tensor, name: str):
                 torch._assert(torch.isnan(right).all(), f"{name}: off-block NaNs leaked (block {b}, right)")
 
 def _assert_cproj_offblock_zero(tensor: torch.Tensor, name: str):
-    if not CPROJ_ASSERT:
+    if not CPROJ_ASSERT or torch._dynamo.is_compiling():
         return
     with torch.no_grad():
         for b in range(NUM_CPROJ_BLOCKS):
@@ -571,7 +571,7 @@ def _assert_cproj_offblock_zero(tensor: torch.Tensor, name: str):
                 torch._assert((right == 0).all(), f"{name}: off-block grad not zero (block {b}, right)")
 
 def _assert_tensor_finite(tensor: torch.Tensor, name: str):
-    if not CPROJ_ASSERT:
+    if not CPROJ_ASSERT or torch._dynamo.is_compiling():
         return
     with torch.no_grad():
         torch._assert(torch.isfinite(tensor).all(), f"{name}: found non-finite values")

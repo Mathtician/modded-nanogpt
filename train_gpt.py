@@ -1831,10 +1831,13 @@ if not USE_DENSE_CPROJ:
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-compile_fullgraph = not CPROJ_ASSERT
-if CPROJ_ASSERT:
-    print0("CPROJ_ASSERT enabled: disabling fullgraph compilation to allow debug asserts", console=True)
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=compile_fullgraph)
+if CPROJ_ASSERT and not USE_DENSE_CPROJ:
+    print0("Running c_proj debug preflight", console=True)
+    with torch.no_grad():
+        x_dbg = torch.randn(1, 8, model.mlp_bank.shape[-1], device=device, dtype=torch.bfloat16)
+        _ = FusedLinearReLUSquareBlockDiagFunction.apply(x_dbg, model.mlp_bank[0, 0], model.mlp_bank[0, 1])
+
+model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
 
 ########################################
