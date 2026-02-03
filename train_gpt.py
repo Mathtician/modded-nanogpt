@@ -889,10 +889,8 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def mask_cproj_offblock_(tensor: torch.Tensor, fill_value: float | None = None):
-    """Fill off-diagonal blocks of c_proj; use NaNs only when CPROJ_ASSERT is enabled."""
-    if fill_value is None:
-        fill_value = float("nan") if CPROJ_ASSERT else 0.0
+def mask_cproj_offblock_(tensor: torch.Tensor, fill_value: float = float("nan")):
+    """Fill off-diagonal blocks of c_proj; NaNs detect accidental usage."""
     assert tensor.shape[-2:] == (3072, 768)
     with torch.no_grad():
         for b in range(3):
