@@ -385,7 +385,7 @@ def cproj_block_diag_bwd_input_kernel(
         w = tl.load(w_ptrs, mask=(offs_k[:, None] < CPROJ_BLOCK_OUT) & (offs_n[None, :] < CPROJ_BLOCK_IN), other=0.0)
         acc = tl.dot(g, w, acc)
         g_ptrs += BLOCK_SIZE_K * stride_gn
-        w_ptrs += BLOCK_SIZE_K * stride_wk
+        w_ptrs += BLOCK_SIZE_K * stride_wn
         offs_k += BLOCK_SIZE_K
 
     # Apply ReLU^2 derivative with saved pre-activation

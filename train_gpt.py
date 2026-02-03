@@ -8,7 +8,7 @@ with open(os.path.join(os.path.dirname(sys.argv[0]), 'triton_kernels.py'), 'r') 
     code += f"\n\n{'-'*40}\n# triton_kernels.py\n{'-'*40}\n\n"
     code += f.read()
 
-# Enable block-diagonal sanity checks to help catch NaNs/off-block writes
+# Enable block-diagonal sanity checks to catch accidental off-block usage
 os.environ.setdefault("CPROJ_ASSERT", "1")
 
 import copy
@@ -889,8 +889,10 @@ def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def mask_cproj_offblock_(tensor: torch.Tensor, fill_value: float = float("nan")):
-    """Fill off-diagonal blocks of c_proj with NaN/Inf to detect unintended use."""
+def mask_cproj_offblock_(tensor: torch.Tensor, fill_value: float | None = None):
+    """Fill off-diagonal blocks of c_proj; use NaNs only when CPROJ_ASSERT is enabled."""
+    if fill_value is None:
+        fill_value = float("nan") if CPROJ_ASSERT else 0.0
     assert tensor.shape[-2:] == (3072, 768)
     with torch.no_grad():
         for b in range(3):
