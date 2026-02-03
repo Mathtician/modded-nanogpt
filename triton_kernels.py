@@ -1,7 +1,16 @@
+import os
 import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+# Block-diagonal c_proj layout (3 x 1024 x 256)
+NUM_CPROJ_BLOCKS = 3
+CPROJ_BLOCK_IN = 1024
+CPROJ_BLOCK_OUT = 256
+CPROJ_ROWS = NUM_CPROJ_BLOCKS * CPROJ_BLOCK_IN   # 3072
+CPROJ_COLS = NUM_CPROJ_BLOCKS * CPROJ_BLOCK_OUT  # 768
+CPROJ_ASSERT = bool(int(os.environ.get("CPROJ_ASSERT", "0")))
 
 # -----------------------------------------------------------------------------
 # Triton kernel for symmetric matrix multiplication by @byronxu99
@@ -248,6 +257,523 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     return out
 
 # -----------------------------------------------------------------------------
+# Block-diagonal matmuls for MLP c_proj (3 blocks of 1024x256)
+
+@triton.jit
+def cproj_block_diag_fwd_kernel(
+    A_ptr, B_ptr, C_ptr,
+    M,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_bn = tl.program_id(1)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(CPROJ_BLOCK_OUT, BLOCK_SIZE_N)
+
+    block_id = pid_bn // num_pid_n
+    pid_n = pid_bn % num_pid_n
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in tl.range(0, tl.cdiv(CPROJ_BLOCK_IN, BLOCK_SIZE_K)):
+        k_offsets = block_id * CPROJ_BLOCK_IN + k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+        a_ptrs = A_ptr + offs_m[:, None] * stride_am + k_offsets[None, :] * stride_ak
+        b_ptrs = B_ptr + k_offsets[:, None] * stride_bk + (block_id * CPROJ_BLOCK_OUT + offs_n)[None, :] * stride_bn
+
+        k_mask = k_offsets[None, :] < (block_id + 1) * CPROJ_BLOCK_IN
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & k_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask.T & (offs_n[None, :] < CPROJ_BLOCK_OUT), other=0.0)
+        accumulator = tl.dot(a, b, accumulator)
+
+    output = accumulator.to(C_ptr.dtype.element_ty)
+    c_ptrs = C_ptr + offs_m[:, None] * stride_cm + (block_id * CPROJ_BLOCK_OUT + offs_n)[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < CPROJ_BLOCK_OUT)
+    tl.store(c_ptrs, output, mask=c_mask)
+
+
+def cproj_block_diag_fwd(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Compute C = A @ B where B is block-diagonal with 3 blocks of size 1024x256.
+    A: (..., M, 3072)
+    B: (3072, 768)
+    Returns: (..., M, 768)
+    """
+    assert A.shape[-1] == CPROJ_ROWS
+    assert B.shape == (CPROJ_ROWS, CPROJ_COLS)
+
+    M = A.shape[-2]
+    C = torch.empty((*A.shape[:-1], CPROJ_COLS), device=A.device, dtype=A.dtype)
+
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 64
+    num_warps = 4
+    num_stages = 4
+
+    grid = (
+        triton.cdiv(M, BLOCK_SIZE_M),
+        NUM_CPROJ_BLOCKS * triton.cdiv(CPROJ_BLOCK_OUT, BLOCK_SIZE_N),
+    )
+    cproj_block_diag_fwd_kernel[grid](
+        A_ptr=A,
+        B_ptr=B,
+        C_ptr=C,
+        M=M,
+        stride_am=A.stride(-2),
+        stride_ak=A.stride(-1),
+        stride_bk=B.stride(0),
+        stride_bn=B.stride(1),
+        stride_cm=C.stride(-2),
+        stride_cn=C.stride(-1),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return C
+
+
+@triton.jit
+def cproj_block_diag_bwd_input_kernel(
+    G_ptr, W_ptr, PRE_ptr, D_ptr,
+    M,
+    stride_gm, stride_gn,
+    stride_wk, stride_wn,
+    stride_pm, stride_pk,
+    stride_dm, stride_dk,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_bn = tl.program_id(1)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(CPROJ_BLOCK_IN, BLOCK_SIZE_N)
+
+    block_id = pid_bn // num_pid_n
+    pid_n = pid_bn % num_pid_n
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    g_ptrs = G_ptr + offs_m[:, None] * stride_gm + (block_id * CPROJ_BLOCK_OUT + offs_k[None, :]) * stride_gn
+    w_ptrs = W_ptr + (block_id * CPROJ_BLOCK_IN + offs_n[None, :]) * stride_wk + (block_id * CPROJ_BLOCK_OUT + offs_k[:, None]) * stride_wn
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in tl.range(0, tl.cdiv(CPROJ_BLOCK_OUT, BLOCK_SIZE_K)):
+        g = tl.load(g_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < CPROJ_BLOCK_OUT), other=0.0)
+        w = tl.load(w_ptrs, mask=(offs_k[:, None] < CPROJ_BLOCK_OUT) & (offs_n[None, :] < CPROJ_BLOCK_IN), other=0.0)
+        acc = tl.dot(g, w, acc)
+        g_ptrs += BLOCK_SIZE_K * stride_gn
+        w_ptrs += BLOCK_SIZE_K * stride_wk
+        offs_k += BLOCK_SIZE_K
+
+    # Apply ReLU^2 derivative with saved pre-activation
+    pre_ptrs = PRE_ptr + offs_m[:, None] * stride_pm + (block_id * CPROJ_BLOCK_IN + offs_n[None, :]) * stride_pk
+    pre = tl.load(pre_ptrs, mask=(offs_m[:, None] < M) & (offs_n[None, :] < CPROJ_BLOCK_IN), other=0.0)
+    gated = 2 * acc * tl.where(pre > 0, pre, 0).to(acc.dtype)
+
+    out = gated.to(D_ptr.dtype.element_ty)
+    d_ptrs = D_ptr + offs_m[:, None] * stride_dm + (block_id * CPROJ_BLOCK_IN + offs_n[None, :]) * stride_dk
+    d_mask = (offs_m[:, None] < M) & (offs_n[None, :] < CPROJ_BLOCK_IN)
+    tl.store(d_ptrs, out, mask=d_mask)
+
+
+def cproj_block_diag_bwd_input(grad_out: torch.Tensor, weight: torch.Tensor, pre: torch.Tensor):
+    """
+    Compute dpre for block-diagonal c_proj: grad_out @ weight.T with ReLU^2 derivative.
+    grad_out: (..., M, 768)
+    weight:   (3072, 768)
+    pre:      (..., M, 3072)
+    returns:  (..., M, 3072)
+    """
+    M = grad_out.shape[-2]
+    assert grad_out.shape[-1] == CPROJ_COLS
+    assert weight.shape == (CPROJ_ROWS, CPROJ_COLS)
+    assert pre.shape[-1] == CPROJ_ROWS
+
+    dpre = torch.zeros_like(pre)
+
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 64
+    num_warps = 4
+    num_stages = 4
+
+    grid = (
+        triton.cdiv(M, BLOCK_SIZE_M),
+        NUM_CPROJ_BLOCKS * triton.cdiv(CPROJ_BLOCK_IN, BLOCK_SIZE_N),
+    )
+    cproj_block_diag_bwd_input_kernel[grid](
+        G_ptr=grad_out,
+        W_ptr=weight,
+        PRE_ptr=pre,
+        D_ptr=dpre,
+        M=M,
+        stride_gm=grad_out.stride(-2),
+        stride_gn=grad_out.stride(-1),
+        stride_wk=weight.stride(0),
+        stride_wn=weight.stride(1),
+        stride_pm=pre.stride(-2),
+        stride_pk=pre.stride(-1),
+        stride_dm=dpre.stride(-2),
+        stride_dk=dpre.stride(-1),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return dpre
+
+
+@triton.jit
+def cproj_block_diag_dweight_kernel(
+    POST_ptr, G_ptr, DW_ptr,
+    M,
+    stride_pm, stride_pk,
+    stride_gm, stride_gn,
+    stride_dk, stride_dn,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    # pid_k encodes block_id and row tile; pid_n encodes col tile
+    pid_k = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    num_pid_k = tl.cdiv(CPROJ_BLOCK_IN, BLOCK_SIZE_M)
+    block_id = pid_k // num_pid_k
+    pid_m = pid_k % num_pid_k
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    post_ptrs = POST_ptr + (offs_k[:, None] * stride_pm) + (block_id * CPROJ_BLOCK_IN + offs_m[None, :]) * stride_pk
+    g_ptrs = G_ptr + (offs_k[:, None] * stride_gm) + (block_id * CPROJ_BLOCK_OUT + offs_n[None, :]) * stride_gn
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for _ in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
+        post = tl.load(post_ptrs, mask=(offs_k[:, None] < M) & (offs_m[None, :] < CPROJ_BLOCK_IN), other=0.0)
+        gout = tl.load(g_ptrs, mask=(offs_k[:, None] < M) & (offs_n[None, :] < CPROJ_BLOCK_OUT), other=0.0)
+        acc += tl.dot(post, gout)
+        post_ptrs += BLOCK_SIZE_K * stride_pm
+        g_ptrs += BLOCK_SIZE_K * stride_gm
+        offs_k += BLOCK_SIZE_K
+
+    out = acc.to(DW_ptr.dtype.element_ty)
+    dw_ptrs = DW_ptr + (block_id * CPROJ_BLOCK_IN + offs_m[:, None]) * stride_dk + (block_id * CPROJ_BLOCK_OUT + offs_n[None, :]) * stride_dn
+    mask = (offs_m[:, None] < CPROJ_BLOCK_IN) & (offs_n[None, :] < CPROJ_BLOCK_OUT)
+    tl.store(dw_ptrs, out, mask=mask)
+
+
+def cproj_block_diag_dweight(post: torch.Tensor, grad_out: torch.Tensor) -> torch.Tensor:
+    """
+    Compute gradient for block-diagonal c_proj weights: post^T @ grad_out (diag blocks only).
+    post: (..., M, 3072)
+    grad_out: (..., M, 768)
+    returns: (3072, 768) with only diag blocks filled
+    """
+    M = post.shape[-2]
+    assert post.shape[-1] == CPROJ_ROWS
+    assert grad_out.shape[-1] == CPROJ_COLS
+    dw = torch.zeros((CPROJ_ROWS, CPROJ_COLS), device=post.device, dtype=post.dtype)
+
+    BLOCK_SIZE_K = 128
+    BLOCK_SIZE_M = 64
+    BLOCK_SIZE_N = 64
+    num_warps = 4
+    num_stages = 4
+
+    grid = (
+        NUM_CPROJ_BLOCKS * triton.cdiv(CPROJ_BLOCK_IN, BLOCK_SIZE_M),
+        triton.cdiv(CPROJ_BLOCK_OUT, BLOCK_SIZE_N),
+    )
+    cproj_block_diag_dweight_kernel[grid](
+        POST_ptr=post,
+        G_ptr=grad_out,
+        DW_ptr=dw,
+        M=M,
+        stride_pm=post.stride(-2),
+        stride_pk=post.stride(-1),
+        stride_gm=grad_out.stride(-2),
+        stride_gn=grad_out.stride(-1),
+        stride_dk=dw.stride(0),
+        stride_dn=dw.stride(1),
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return dw
+
+def _assert_cproj_offblock_nan(tensor: torch.Tensor, name: str):
+    if not CPROJ_ASSERT:
+        return
+    with torch.no_grad():
+        for b in range(NUM_CPROJ_BLOCKS):
+            r0 = b * CPROJ_BLOCK_IN
+            r1 = r0 + CPROJ_BLOCK_IN
+            c0 = b * CPROJ_BLOCK_OUT
+            c1 = c0 + CPROJ_BLOCK_OUT
+            left = tensor[..., r0:r1, :c0]
+            right = tensor[..., r0:r1, c1:]
+            if left.numel():
+                assert torch.isnan(left).all(), f"{name}: off-block NaNs leaked (block {b}, left)"
+            if right.numel():
+                assert torch.isnan(right).all(), f"{name}: off-block NaNs leaked (block {b}, right)"
+
+def _assert_cproj_offblock_zero(tensor: torch.Tensor, name: str):
+    if not CPROJ_ASSERT:
+        return
+    with torch.no_grad():
+        for b in range(NUM_CPROJ_BLOCKS):
+            r0 = b * CPROJ_BLOCK_IN
+            r1 = r0 + CPROJ_BLOCK_IN
+            c0 = b * CPROJ_BLOCK_OUT
+            c1 = c0 + CPROJ_BLOCK_OUT
+            left = tensor[..., r0:r1, :c0]
+            right = tensor[..., r0:r1, c1:]
+            if left.numel():
+                assert (left == 0).all(), f"{name}: off-block grad not zero (block {b}, left)"
+            if right.numel():
+                assert (right == 0).all(), f"{name}: off-block grad not zero (block {b}, right)"
+
+def _assert_tensor_finite(tensor: torch.Tensor, name: str):
+    if not CPROJ_ASSERT:
+        return
+    with torch.no_grad():
+        assert torch.isfinite(tensor).all(), f"{name}: found non-finite values"
+
+# -----------------------------------------------------------------------------
+# Block-diagonal XXT and ba_plus_cAA (used by NorMuon on c_proj)
+
+@triton.jit
+def XXT_block_diag_kernel(
+    A_ptr, C_ptr,
+    M, K,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    batch_idx, m_idx, n_idx = _pid_to_block(
+        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    block_rows = M // NUM_CPROJ_BLOCKS
+    block_cols = K // NUM_CPROJ_BLOCKS
+
+    block_m = m_idx // block_rows
+    block_n = n_idx // block_rows
+    if block_m != block_n:
+        return  # Off-diagonal blocks are zero for block-diagonal input
+
+    # Skip blocks that don't need to be computed (upper/lower tri)
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    offs_m = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    k_offsets = block_m * block_cols + tl.arange(0, BLOCK_SIZE_K)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for _ in tl.range(0, tl.cdiv(block_cols, BLOCK_SIZE_K)):
+        a_ptrs = A_ptr + offs_m[:, None] * a_stride_r + k_offsets[None, :] * a_stride_c
+        at_ptrs = A_ptr + k_offsets[:, None] * a_stride_c + offs_n[None, :] * a_stride_r
+        k_mask = k_offsets[None, :] < (block_m + 1) * block_cols
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & k_mask, other=0.0)
+        at = tl.load(at_ptrs, mask=k_mask.T & (offs_n[None, :] < M), other=0.0)
+        accumulator = tl.dot(a, at, accumulator)
+        k_offsets += BLOCK_SIZE_K
+
+    output = accumulator.to(C_ptr.dtype.element_ty)
+    c_ptrs = C_ptr + offs_m[:, None] * c_stride_r + offs_n[None, :] * c_stride_c
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < M)
+    tl.store(c_ptrs, output, mask=c_mask)
+    # Mirror across diagonal for symmetry
+    c_ptrs_t = C_ptr + offs_n[:, None] * c_stride_r + offs_m[None, :] * c_stride_c
+    tl.store(c_ptrs_t, output.T, mask=c_mask.T)
+
+
+def XXT_block_diag(A: torch.Tensor, out: torch.Tensor):
+    """
+    Compute C = A @ A.T for block-diagonal A (3 blocks).
+    Only diagonal blocks are computed.
+    """
+    assert A.ndim == 2 or A.ndim == 3
+    M, K = A.shape[-2:]
+    assert out.size(-2) == M and out.size(-1) == M
+    assert M % NUM_CPROJ_BLOCKS == 0 and K % NUM_CPROJ_BLOCKS == 0
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 64
+    num_stages, num_warps = 4, 4
+
+    out.zero_()
+    grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
+    XXT_block_diag_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        K=K,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=8,
+        LOWER_UPPER=1,
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    return out
+
+
+@triton.jit
+def ba_plus_cAA_block_diag_kernel(
+    A_ptr, C_ptr,
+    M, K,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+    alpha, beta,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    batch_idx, m_idx, n_idx = _pid_to_block(
+        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    block_rows = M // NUM_CPROJ_BLOCKS
+    block_cols = K // NUM_CPROJ_BLOCKS
+
+    block_m = m_idx // block_rows
+    block_n = n_idx // block_rows
+    if block_m != block_n:
+        return
+
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    offs_m = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    k_offsets = block_m * block_cols + tl.arange(0, BLOCK_SIZE_K)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for _ in tl.range(0, tl.cdiv(block_cols, BLOCK_SIZE_K)):
+        a_ptrs = A_ptr + offs_m[:, None] * a_stride_r + k_offsets[None, :] * a_stride_c
+        at_ptrs = A_ptr + k_offsets[:, None] * a_stride_c + offs_n[None, :] * a_stride_r
+        k_mask = k_offsets[None, :] < (block_m + 1) * block_cols
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & k_mask, other=0.0)
+        at = tl.load(at_ptrs, mask=k_mask.T & (offs_n[None, :] < M), other=0.0)
+        accumulator = tl.dot(a, at, accumulator)
+        k_offsets += BLOCK_SIZE_K
+
+    # Load block of A to add (corresponds to the current diagonal block of C)
+    offs_am = offs_m
+    offs_an = offs_n
+    a_add_ptrs = A_ptr + offs_am[:, None] * a_stride_r + offs_an[None, :] * a_stride_c
+    a_add_mask = (offs_am[:, None] < M) & (offs_an[None, :] < M)
+    a_add = tl.load(a_add_ptrs, mask=a_add_mask, other=0.0).to(tl.float32)
+
+    accumulator *= alpha
+    accumulator += a_add * beta
+
+    output = accumulator.to(C_ptr.dtype.element_ty)
+    c_ptrs = C_ptr + offs_m[:, None] * c_stride_r + offs_n[None, :] * c_stride_c
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < M)
+    tl.store(c_ptrs, output, mask=c_mask)
+    c_ptrs_t = C_ptr + offs_n[:, None] * c_stride_r + offs_m[None, :] * c_stride_c
+    tl.store(c_ptrs_t, output.T, mask=c_mask.T)
+
+
+def ba_plus_cAA_block_diag(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
+    """
+    Compute C = alpha * A @ A.T + beta * A for block-diagonal A (3 blocks).
+    Only diagonal blocks are computed.
+    """
+    assert A.ndim == 2 or A.ndim == 3
+    M, K = A.shape[-2:]
+    assert out.size(-2) == M and out.size(-1) == M
+    assert M % NUM_CPROJ_BLOCKS == 0 and K % NUM_CPROJ_BLOCKS == 0
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 64
+    num_stages, num_warps = 4, 4
+
+    out.zero_()
+    grid = (batch_size * triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(M, BLOCK_SIZE_N),)
+    ba_plus_cAA_block_diag_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        K=K,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        alpha=alpha,
+        beta=beta,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=8,
+        LOWER_UPPER=1,
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    return out
+
+# -----------------------------------------------------------------------------
 # Triton kernel for MLP: relu(x @ W1.T)^2, by @andrewbriand, @jrauvola
 
 @triton.jit
@@ -382,6 +908,31 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
         dW1 = dpre.T @ x
         dx = dpre @ W1
+        return dx.view(x.shape), dW1, dW2
+
+
+class FusedLinearReLUSquareBlockDiagFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, W1, W2):
+        _assert_cproj_offblock_nan(W2, "c_proj_weight_forward")
+        x_flat = x.view((-1, x.shape[-1]))
+        pre, post = linear_relu_square(x_flat, W1)
+        out = cproj_block_diag_fwd(post, W2)
+        _assert_tensor_finite(out, "c_proj_forward_out")
+        ctx.save_for_backward(x, W1, W2, pre, post)
+        return out.view(x.shape)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, W1, W2, pre, post = ctx.saved_tensors
+        grad_flat = grad_output.view((-1, grad_output.shape[-1]))
+        _assert_tensor_finite(grad_flat, "c_proj_grad_out")
+        dW2 = cproj_block_diag_dweight(post, grad_flat)
+        dpre = cproj_block_diag_bwd_input(grad_flat, W2, pre)
+        x_flat = x.view((-1, x.shape[-1]))
+        dW1 = dpre.T @ x_flat
+        dx = dpre @ W1
+        _assert_cproj_offblock_zero(dW2, "c_proj_grad_weight")
         return dx.view(x.shape), dW1, dW2
 
 # -----------------------------------------------------------------------------

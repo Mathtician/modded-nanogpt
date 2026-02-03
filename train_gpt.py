@@ -34,7 +34,15 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
+from triton_kernels import (
+    XXT,
+    XXT_block_diag,
+    ba_plus_cAA,
+    ba_plus_cAA_block_diag,
+    FusedLinearReLUSquareFunction,
+    FusedLinearReLUSquareBlockDiagFunction,
+    FusedSoftcappedCrossEntropy,
+)
 
 dynamo.config.recompile_limit = 64
 
@@ -51,6 +59,8 @@ torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
+USE_DENSE_CPROJ = bool(int(os.environ.get("USE_DENSE_CPROJ", "0")))
+CPROJ_ASSERT = bool(int(os.environ.get("CPROJ_ASSERT", "0")))
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -205,6 +215,47 @@ def polar_express(G: torch.Tensor, split_baddbmm: bool = False):
         X, C = C, X  # Swap references to avoid unnecessary copies
 
     if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def polar_express_block_diag(G: torch.Tensor, split_baddbmm: bool = False):
+    """
+    Block-diagonal variant of Polar Express for c_proj (3 blocks of 1024x256).
+    """
+    X = G.bfloat16()
+    transposed = False
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+        transposed = True
+
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
+
+    X = X.contiguous()
+    A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+    B = torch.empty_like(A)
+    C = torch.empty_like(X)
+
+    # Select batched vs unbatched
+    if split_baddbmm:
+        BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
+    else:
+        aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
+
+    for a, b, c in polar_express_coeffs:
+        XXT_block_diag(X, out=A)
+        ba_plus_cAA_block_diag(A, alpha=c, beta=b, out=B)
+
+        if split_baddbmm:
+            BX_matmul(B, X, out=C)  # C = B @ X
+            C.add_(X, alpha=a)      # C = C + a*X
+        else:
+            aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
+
+        X, C = C, X  # Swap references to avoid unnecessary copies
+
+    if transposed:
         X = X.mT
     return X
 
@@ -719,35 +770,75 @@ class NorMuonAndAdam:
         momentum_buffer.lerp_(grad_chunk, 1 - p_cfg.momentum)
         updated_grads = grad_chunk.lerp_(momentum_buffer, p_cfg.momentum)
 
+        param_view = param.data.view(p_cfg.reshape)
+        p_slice = param_view[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
+        mantissa = p_state["mantissa"]
+        second_mom = p_state["second_momentum_buffer"]
+
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
-        # Polar Express orthogonalization
-        is_large_matrix = chunk_shape[-2] > 1024
-        v_chunk = polar_express(updated_grads, split_baddbmm=is_large_matrix)
-
-        # Variance reduction
-        red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
-        v_chunk = NorMuonAndAdam._apply_normuon_variance_reduction(
-            v_chunk, p_state["second_momentum_buffer"], p_cfg.beta2, red_dim
-        )
-
-        # Update parameter, in place, with cautious weight decay
-        param_view = param.data.view(p_cfg.reshape)
-        p_slice = param_view[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
-
         # MLP has per-matrix LR multipliers (c_proj gets 2x LR)
         if p_cfg.per_matrix_lr_mul is not None:
+            base_idx = rank * p_cfg.chunk_size
+
+            def _block_view(t: torch.Tensor, r0: int, r1: int, c0: int, c1: int):
+                stride_r, stride_c = t.stride(-2), t.stride(-1)
+                offset = t.storage_offset() + r0 * stride_r + c0 * stride_c
+                return torch.as_strided(t, (r1 - r0, c1 - c0), (stride_r, stride_c), storage_offset=offset)
+
             for mat_idx in range(p_cfg.chunk_size):
+                global_idx = base_idx + mat_idx
+                is_c_proj = (global_idx % 2 == 1)
+                use_block_diag = is_c_proj and not USE_DENSE_CPROJ
+                grad_mat = updated_grads[mat_idx]
+
+                is_large_matrix = grad_mat.shape[-2] > 1024
+                if use_block_diag:
+                    v_mat = polar_express_block_diag(grad_mat, split_baddbmm=is_large_matrix)
+                else:
+                    v_mat = polar_express(grad_mat, split_baddbmm=is_large_matrix)
+
+                red_dim = -1 if grad_mat.shape[-2] >= grad_mat.shape[-1] else -2
+                v_mat = NorMuonAndAdam._apply_normuon_variance_reduction(
+                    v_mat, second_mom[mat_idx], p_cfg.beta2, red_dim
+                )
+
                 self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.per_matrix_lr_mul[mat_idx] * p_cfg.lr)
                 self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
-                NorMuonAndAdam._cautious_wd_and_update_inplace(
-                    p_slice[mat_idx].view(torch.uint16), p_state["mantissa"][mat_idx], v_chunk[mat_idx],
-                    self._eff_wd_t, self._eff_lr_t
-                )
+
+                if use_block_diag:
+                    p_block_uint = p_slice[mat_idx].view(torch.uint16)
+                    mant_block = mantissa[mat_idx]
+                    for b in range(3):
+                        r0 = b * 1024
+                        r1 = r0 + 1024
+                        c0 = b * 256
+                        c1 = c0 + 256
+                        p_view = _block_view(p_block_uint, r0, r1, c0, c1)
+                        m_view = _block_view(mant_block, r0, r1, c0, c1)
+                        v_view = _block_view(v_mat, r0, r1, c0, c1)
+                        NorMuonAndAdam._cautious_wd_and_update_inplace(
+                            p_view, m_view, v_view, self._eff_wd_t, self._eff_lr_t
+                        )
+                else:
+                    NorMuonAndAdam._cautious_wd_and_update_inplace(
+                        p_slice[mat_idx].view(torch.uint16), mantissa[mat_idx], v_mat,
+                        self._eff_wd_t, self._eff_lr_t
+                    )
         else:
+            # Polar Express orthogonalization
+            is_large_matrix = chunk_shape[-2] > 1024
+            v_chunk = polar_express(updated_grads, split_baddbmm=is_large_matrix)
+
+            # Variance reduction
+            red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
+            v_chunk = NorMuonAndAdam._apply_normuon_variance_reduction(
+                v_chunk, second_mom, p_cfg.beta2, red_dim
+            )
+
             NorMuonAndAdam._cautious_wd_and_update_inplace(
-                p_slice.view(torch.uint16), p_state["mantissa"], v_chunk,
+                p_slice.view(torch.uint16), mantissa, v_chunk,
                 self._eff_wd_t, self._eff_lr_t
             )
 
@@ -793,6 +884,21 @@ class NorMuonAndAdam:
 
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
+
+
+def mask_cproj_offblock_(tensor: torch.Tensor, fill_value: float = float("nan")):
+    """Fill off-diagonal blocks of c_proj with NaN/Inf to detect unintended use."""
+    assert tensor.shape[-2:] == (3072, 768)
+    with torch.no_grad():
+        for b in range(3):
+            r0 = b * 1024
+            r1 = r0 + 1024
+            c0 = b * 256
+            c1 = c0 + 256
+            if c0:
+                tensor[..., r0:r1, :c0].fill_(fill_value)
+            if c1 < tensor.size(-1):
+                tensor[..., r0:r1, c1:].fill_(fill_value)
 
 
 class CastedLinearT(nn.Module):
@@ -988,7 +1094,9 @@ class MLP(nn.Module):
         # relu(x)^2:
         # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         # Fused triton kernel for relu(x @ W1.T)^2 @ W2.T
-        return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
+        if USE_DENSE_CPROJ:
+            return FusedLinearReLUSquareFunction.apply(x, c_fc, c_proj)
+        return FusedLinearReLUSquareBlockDiagFunction.apply(x, c_fc, c_proj)
 
 class Block(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, has_attn: bool, has_mlp: bool, use_paired_head: bool):
@@ -1084,6 +1192,8 @@ class GPT(nn.Module):
             self.attn_bank.uniform_(-bound, bound)
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
+            if not USE_DENSE_CPROJ:
+                mask_cproj_offblock_(self.mlp_bank[:, 1, :, :])
 
         # Create blocks with has_attn/has_mlp flags
         self.paired_head_layers = [0, 2, 5, 9]
