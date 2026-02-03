@@ -550,9 +550,9 @@ def _assert_cproj_offblock_nan(tensor: torch.Tensor, name: str):
             left = tensor[..., r0:r1, :c0]
             right = tensor[..., r0:r1, c1:]
             if left.numel():
-                assert torch.isnan(left).all(), f"{name}: off-block NaNs leaked (block {b}, left)"
+                torch._assert(torch.isnan(left).all(), f"{name}: off-block NaNs leaked (block {b}, left)")
             if right.numel():
-                assert torch.isnan(right).all(), f"{name}: off-block NaNs leaked (block {b}, right)"
+                torch._assert(torch.isnan(right).all(), f"{name}: off-block NaNs leaked (block {b}, right)")
 
 def _assert_cproj_offblock_zero(tensor: torch.Tensor, name: str):
     if not CPROJ_ASSERT:
@@ -566,15 +566,15 @@ def _assert_cproj_offblock_zero(tensor: torch.Tensor, name: str):
             left = tensor[..., r0:r1, :c0]
             right = tensor[..., r0:r1, c1:]
             if left.numel():
-                assert (left == 0).all(), f"{name}: off-block grad not zero (block {b}, left)"
+                torch._assert((left == 0).all(), f"{name}: off-block grad not zero (block {b}, left)")
             if right.numel():
-                assert (right == 0).all(), f"{name}: off-block grad not zero (block {b}, right)"
+                torch._assert((right == 0).all(), f"{name}: off-block grad not zero (block {b}, right)")
 
 def _assert_tensor_finite(tensor: torch.Tensor, name: str):
     if not CPROJ_ASSERT:
         return
     with torch.no_grad():
-        assert torch.isfinite(tensor).all(), f"{name}: found non-finite values"
+        torch._assert(torch.isfinite(tensor).all(), f"{name}: found non-finite values")
 
 # -----------------------------------------------------------------------------
 # Block-diagonal XXT and ba_plus_cAA (used by NorMuon on c_proj)
