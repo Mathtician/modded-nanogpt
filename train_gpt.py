@@ -8,6 +8,9 @@ with open(os.path.join(os.path.dirname(sys.argv[0]), 'triton_kernels.py'), 'r') 
     code += f"\n\n{'-'*40}\n# triton_kernels.py\n{'-'*40}\n\n"
     code += f.read()
 
+# Enable block-diagonal sanity checks to help catch NaNs/off-block writes
+os.environ.setdefault("CPROJ_ASSERT", "1")
+
 import copy
 import glob
 import math
