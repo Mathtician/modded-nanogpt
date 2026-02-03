@@ -1831,7 +1831,10 @@ if not USE_DENSE_CPROJ:
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+compile_fullgraph = not CPROJ_ASSERT
+if CPROJ_ASSERT:
+    print0("CPROJ_ASSERT enabled: disabling fullgraph compilation to allow debug asserts", console=True)
+model: nn.Module = torch.compile(model, dynamic=False, fullgraph=compile_fullgraph)
 training_manager = TrainingManager(model)
 
 ########################################
