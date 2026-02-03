@@ -724,24 +724,7 @@ class NorMuonAndAdam:
 
         # Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
-        if p_cfg.per_matrix_lr_mul is not None:
-            rows = chunk_shape[-2] // 3
-            cols = chunk_shape[-1] // 3
-            if rows * 3 != chunk_shape[-2] or cols * 3 != chunk_shape[-1]:
-                raise ValueError("MLP matrices must be divisible by 3 in both dimensions")
-            v_chunk = torch.empty_like(updated_grads)
-            for mat_idx in range(p_cfg.chunk_size):
-                is_c_proj = (p_cfg.per_matrix_lr_mul[mat_idx] != 1.0)
-                if is_c_proj:
-                    v_chunk[mat_idx] = NorMuonAndAdam._polar_express_block_diag(
-                        updated_grads[mat_idx], rows, cols
-                    )
-                else:
-                    v_chunk[mat_idx] = polar_express(
-                        updated_grads[mat_idx], split_baddbmm=is_large_matrix
-                    )
-        else:
-            v_chunk = polar_express(updated_grads, split_baddbmm=is_large_matrix)
+        v_chunk = polar_express(updated_grads, split_baddbmm=is_large_matrix)
 
         # Variance reduction
         red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
@@ -755,8 +738,6 @@ class NorMuonAndAdam:
 
         # MLP has per-matrix LR multipliers (c_proj gets 2x LR)
         if p_cfg.per_matrix_lr_mul is not None:
-            rows = p_slice.shape[-2] // 3
-            cols = p_slice.shape[-1] // 3
             for mat_idx in range(p_cfg.chunk_size):
                 self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.per_matrix_lr_mul[mat_idx] * p_cfg.lr)
                 self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
@@ -764,10 +745,6 @@ class NorMuonAndAdam:
                     p_slice[mat_idx].view(torch.uint16), p_state["mantissa"][mat_idx], v_chunk[mat_idx],
                     self._eff_wd_t, self._eff_lr_t
                 )
-                if p_cfg.per_matrix_lr_mul[mat_idx] != 1.0:
-                    NorMuonAndAdam._zero_block_offdiag_(p_slice[mat_idx], rows, cols)
-                    if __debug__:
-                        NorMuonAndAdam._assert_block_offdiag_zero_(p_slice[mat_idx], rows, cols)
         else:
             NorMuonAndAdam._cautious_wd_and_update_inplace(
                 p_slice.view(torch.uint16), p_state["mantissa"], v_chunk,
@@ -810,34 +787,6 @@ class NorMuonAndAdam:
         v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
         final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
         return v_chunk.mul_(final_scale.type_as(v_chunk))
-
-    @staticmethod
-    def _polar_express_block_diag(mat: Tensor, rows: int, cols: int) -> Tensor:
-        """Polar Express on three block-diagonal slices of mat."""
-        out = torch.zeros_like(mat)
-        out[:rows, :cols] = polar_express(mat[:rows, :cols], split_baddbmm=False)
-        out[rows:2 * rows, cols:2 * cols] = polar_express(mat[rows:2 * rows, cols:2 * cols], split_baddbmm=False)
-        out[2 * rows:, 2 * cols:] = polar_express(mat[2 * rows:, 2 * cols:], split_baddbmm=False)
-        return out
-
-    @staticmethod
-    def _zero_block_offdiag_(mat: Tensor, rows: int, cols: int) -> None:
-        """Zero out off-diagonal blocks in-place."""
-        mat[:rows, cols:] = 0
-        mat[rows:2 * rows, :cols] = 0
-        mat[rows:2 * rows, 2 * cols:] = 0
-        mat[2 * rows:, :2 * cols] = 0
-
-    @staticmethod
-    def _assert_block_offdiag_zero_(mat: Tensor, rows: int, cols: int) -> None:
-        """Debug-only check for off-diagonal zeros."""
-        max_vals = torch.stack([
-            mat[:rows, cols:].float().abs().max(),
-            mat[rows:2 * rows, :cols].float().abs().max(),
-            mat[rows:2 * rows, 2 * cols:].float().abs().max(),
-            mat[2 * rows:, :2 * cols].float().abs().max(),
-        ])
-        torch._assert(max_vals.max() == 0, "c_proj off-diagonal weights must stay zero")
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model

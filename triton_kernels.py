@@ -371,40 +371,15 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, W1, W2):
         pre, post = linear_relu_square(x.view((-1, x.shape[-1])), W1)
-        rows = W2.shape[0] // 3
-        cols = W2.shape[1] // 3
-        if rows * 3 != W2.shape[0] or cols * 3 != W2.shape[1]:
-            raise ValueError("W2 shape must be divisible by 3 in both dimensions")
-
-        x3 = torch.empty((post.shape[0], W2.shape[1]), device=post.device, dtype=post.dtype)
-        x3[:, :cols] = post[:, :rows] @ W2[:rows, :cols]
-        x3[:, cols:2 * cols] = post[:, rows:2 * rows] @ W2[rows:2 * rows, cols:2 * cols]
-        x3[:, 2 * cols:] = post[:, 2 * rows:] @ W2[2 * rows:, 2 * cols:]
+        x3 = post @ W2
         ctx.save_for_backward(x, W1, W2, pre, post)
         return x3.view(x.shape)
 
     @staticmethod
     def backward(ctx, grad_output):
         x, W1, W2, pre, post = ctx.saved_tensors
-        rows = W2.shape[0] // 3
-        cols = W2.shape[1] // 3
-        if rows * 3 != W2.shape[0] or cols * 3 != W2.shape[1]:
-            raise ValueError("W2 shape must be divisible by 3 in both dimensions")
-
-        grad_output = grad_output.view((-1, grad_output.shape[-1]))
-        dW2 = torch.zeros_like(W2)
-        dW2[:rows, :cols] = post[:, :rows].T @ grad_output[:, :cols]
-        dW2[rows:2 * rows, cols:2 * cols] = post[:, rows:2 * rows].T @ grad_output[:, cols:2 * cols]
-        dW2[2 * rows:, 2 * cols:] = post[:, 2 * rows:].T @ grad_output[:, 2 * cols:]
-
-        dpre = torch.empty_like(pre)
-        dpre[:, :rows] = linear_relu_square(grad_output[:, :cols], W2[:rows, :cols], aux=pre[:, :rows])
-        dpre[:, rows:2 * rows] = linear_relu_square(
-            grad_output[:, cols:2 * cols], W2[rows:2 * rows, cols:2 * cols], aux=pre[:, rows:2 * rows]
-        )
-        dpre[:, 2 * rows:] = linear_relu_square(
-            grad_output[:, 2 * cols:], W2[2 * rows:, 2 * cols:], aux=pre[:, 2 * rows:]
-        )
+        dW2 = post.T @ grad_output
+        dpre = linear_relu_square(grad_output.view((-1, grad_output.shape[-1])), W2, aux=pre)
         dW1 = dpre.T @ x
         dx = dpre @ W1
         return dx.view(x.shape), dW1, dW2
