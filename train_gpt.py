@@ -1825,6 +1825,9 @@ model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.attn_bank.data = model.attn_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+# Re-apply block-diagonal NaN mask in case a loaded checkpoint was dense
+if not USE_DENSE_CPROJ:
+    mask_cproj_offblock_(model.mlp_bank[:, 1, :, :])
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
@@ -1860,6 +1863,9 @@ for step in warmup_steps:
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
+# Ensure c_proj remains block-diagonal after reloads
+if not USE_DENSE_CPROJ:
+    mask_cproj_offblock_(model.mlp_bank[:, 1, :, :])
 training_manager.reset(initial_state["optimizer"])
 del val_loader, train_loader, initial_state
 model.train()
