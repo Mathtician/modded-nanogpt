@@ -269,6 +269,9 @@ def cproj_block_diag_fwd_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    CPROJ_BLOCK_IN: tl.constexpr,
+    CPROJ_BLOCK_OUT: tl.constexpr,
+    NUM_CPROJ_BLOCKS: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_bn = tl.program_id(1)
@@ -336,6 +339,9 @@ def cproj_block_diag_fwd(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
+        CPROJ_BLOCK_IN=CPROJ_BLOCK_IN,
+        CPROJ_BLOCK_OUT=CPROJ_BLOCK_OUT,
+        NUM_CPROJ_BLOCKS=NUM_CPROJ_BLOCKS,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -353,6 +359,9 @@ def cproj_block_diag_bwd_input_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    CPROJ_BLOCK_IN: tl.constexpr,
+    CPROJ_BLOCK_OUT: tl.constexpr,
+    NUM_CPROJ_BLOCKS: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_bn = tl.program_id(1)
@@ -432,6 +441,9 @@ def cproj_block_diag_bwd_input(grad_out: torch.Tensor, weight: torch.Tensor, pre
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
+        CPROJ_BLOCK_IN=CPROJ_BLOCK_IN,
+        CPROJ_BLOCK_OUT=CPROJ_BLOCK_OUT,
+        NUM_CPROJ_BLOCKS=NUM_CPROJ_BLOCKS,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -448,6 +460,9 @@ def cproj_block_diag_dweight_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    CPROJ_BLOCK_IN: tl.constexpr,
+    CPROJ_BLOCK_OUT: tl.constexpr,
+    NUM_CPROJ_BLOCKS: tl.constexpr,
 ):
     # pid_k encodes block_id and row tile; pid_n encodes col tile
     pid_k = tl.program_id(0)
@@ -515,6 +530,9 @@ def cproj_block_diag_dweight(post: torch.Tensor, grad_out: torch.Tensor) -> torc
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
+        CPROJ_BLOCK_IN=CPROJ_BLOCK_IN,
+        CPROJ_BLOCK_OUT=CPROJ_BLOCK_OUT,
+        NUM_CPROJ_BLOCKS=NUM_CPROJ_BLOCKS,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -572,6 +590,7 @@ def XXT_block_diag_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     LOWER_UPPER: tl.constexpr,
+    NUM_CPROJ_BLOCKS: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     batch_idx, m_idx, n_idx = _pid_to_block(
@@ -656,6 +675,7 @@ def XXT_block_diag(A: torch.Tensor, out: torch.Tensor):
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         GROUP_SIZE_M=8,
         LOWER_UPPER=1,
+        NUM_CPROJ_BLOCKS=NUM_CPROJ_BLOCKS,
         num_stages=num_stages,
         num_warps=num_warps,
     )
@@ -674,6 +694,7 @@ def ba_plus_cAA_block_diag_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     LOWER_UPPER: tl.constexpr,
+    NUM_CPROJ_BLOCKS: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     batch_idx, m_idx, n_idx = _pid_to_block(
@@ -768,6 +789,7 @@ def ba_plus_cAA_block_diag(A: torch.Tensor, alpha: float, beta: float, out: torc
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         GROUP_SIZE_M=8,
         LOWER_UPPER=1,
+        NUM_CPROJ_BLOCKS=NUM_CPROJ_BLOCKS,
         num_stages=num_stages,
         num_warps=num_warps,
     )
