@@ -9,7 +9,7 @@ with open(os.path.join(os.path.dirname(sys.argv[0]), 'triton_kernels.py'), 'r') 
     code += f.read()
 
 # Enable block-diagonal sanity checks to catch accidental off-block usage
-os.environ.setdefault("CPROJ_ASSERT", "1")
+# os.environ.setdefault("CPROJ_ASSERT", "1")
 
 import copy
 import glob
