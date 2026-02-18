@@ -454,7 +454,8 @@ class NorMuonAndAdam:
             adam_lr = table_entry.get("adam_lr", self.adam_defaults["lr"])
             adam_wd = table_entry.get("adam_weight_decay", self.adam_defaults["weight_decay"])
             adam_eps = table_entry.get("adam_eps", self.adam_defaults["eps"])
-            reshape = getattr(param, "reshape", None) if comms.startswith("sharded") else None
+            reshape_attr = getattr(param, "reshape", None) if comms.startswith("sharded") else None
+            reshape = reshape_attr if isinstance(reshape_attr, tuple) else None
             if comms.startswith("sharded"):
                 if reshape is not None:
                     if reshape[0] % self.world_size != 0:
@@ -487,7 +488,7 @@ class NorMuonAndAdam:
             )
         elif optim == "normuon":
             reshape = getattr(param, "reshape", None)
-            if reshape is None:
+            if not isinstance(reshape, tuple):
                 raise ValueError(f"NorMuon param {label} must have .reshape attribute")
             if reshape[0] % self.world_size != 0:
                 raise ValueError(f"reshape[0]={reshape[0]} must be divisible by world_size")
