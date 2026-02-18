@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 
 # Read the current file and the kernels file code ASAP, for logging
 with open(sys.argv[0], 'r') as f:
@@ -1620,8 +1621,29 @@ class Hyperparameters:
     save_checkpoint: bool = False
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
+    # magma / skipupdate
+    attn_optim: str = "normuon"  # "normuon", "magma", "skip"
+    mlp_optim: str = "normuon"   # "normuon", "magma", "skip"
+    magma_p: float = 0.5
+    magma_tau: float = 2.0
+    magma_ema: float = 0.9
 
-args = Hyperparameters()
+def _parse_hparams() -> Hyperparameters:
+    hparams = Hyperparameters()
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--attn-optim", choices=["normuon", "magma", "skip"], default=None)
+    parser.add_argument("--mlp-optim", choices=["normuon", "magma", "skip"], default=None)
+    parser.add_argument("--magma-p", type=float, default=None)
+    parser.add_argument("--magma-tau", type=float, default=None)
+    parser.add_argument("--magma-ema", type=float, default=None)
+    parsed, _ = parser.parse_known_args()
+    for key in ("attn_optim", "mlp_optim", "magma_p", "magma_tau", "magma_ema"):
+        val = getattr(parsed, key)
+        if val is not None:
+            setattr(hparams, key, val)
+    return hparams
+
+args = _parse_hparams()
 
 @dataclass
 class TrainingStage:
@@ -1735,8 +1757,8 @@ class TrainingManager():
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         self.param_table = {
-            "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None, "magma": "magma"},
-            "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None, "magma": "magma"},
+            "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
@@ -1748,6 +1770,11 @@ class TrainingManager():
             "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
+
+        if args.attn_optim in ("magma", "skip"):
+            self.param_table["attn"]["magma"] = args.attn_optim
+        if args.mlp_optim in ("magma", "skip"):
+            self.param_table["mlp"]["magma"] = args.mlp_optim
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
@@ -1774,9 +1801,9 @@ class TrainingManager():
         )
 
         magma_defaults = dict(
-            p=0.5,
-            tau=2.0,
-            ema=0.9,
+            p=args.magma_p,
+            tau=args.magma_tau,
+            ema=args.magma_ema,
         )
 
         self.optimizer = NorMuonAndAdam(
