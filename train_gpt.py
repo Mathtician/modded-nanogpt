@@ -1960,6 +1960,12 @@ def nvidia_smi():
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
 print0(nvidia_smi())
 print0("="*100)
+print0(
+    "Optimizer settings: "
+    f"attn_optim={args.attn_optim}, mlp_optim={args.mlp_optim}, "
+    f"magma_p={args.magma_p}, magma_tau={args.magma_tau}, magma_ema={args.magma_ema}",
+    console=True,
+)
 
 model: nn.Module = GPT(
     vocab_size=50257,
