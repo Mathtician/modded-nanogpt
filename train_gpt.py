@@ -324,6 +324,11 @@ class ParamConfig:
     momentum: float | None = None
     beta2: float | None = None
     per_matrix_lr_mul: list[float] | None = None
+    # Magma/SkipUpdate (optimizer wrapper)
+    magma_mode: str | None = None  # "magma", "skip", or None
+    magma_p: float | None = None
+    magma_tau: float | None = None
+    magma_ema: float | None = None
 
 
 class NorMuonAndAdam:
@@ -378,12 +383,13 @@ class NorMuonAndAdam:
     # @tuttyfrutyee, @vdlad, @ryanyang0, @vagrawal, @varunneal, @chrisjmccormick
     """
     def __init__(self, named_params, param_table: dict, scatter_order: list, work_order: list,
-                 adam_defaults: dict, normuon_defaults: dict):
+                 adam_defaults: dict, normuon_defaults: dict, magma_defaults: dict | None = None):
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         # Store defaults for each optimizer type
         self.adam_defaults = adam_defaults
         self.normuon_defaults = normuon_defaults
+        self.magma_defaults = magma_defaults or {}
         self.param_table = param_table
         self.scatter_order = scatter_order
         self.work_order = work_order
@@ -435,6 +441,10 @@ class NorMuonAndAdam:
         adam_betas = table_entry.get("adam_betas")
         lr_mul = table_entry.get("lr_mul", 1.0)
         wd_mul = table_entry.get("wd_mul", 1.0)
+        magma_mode = table_entry.get("magma")
+        magma_p = table_entry.get("magma_p", self.magma_defaults.get("p", 0.5))
+        magma_tau = table_entry.get("magma_tau", self.magma_defaults.get("tau", 2.0))
+        magma_ema = table_entry.get("magma_ema", self.magma_defaults.get("ema", 0.9))
 
         if optim == "adam":
             chunk_size = param.shape[0] // self.world_size if comms.startswith("sharded") else None
@@ -452,6 +462,8 @@ class NorMuonAndAdam:
                 chunk_size=chunk_size,
             )
         elif optim == "normuon":
+            if magma_mode is not None and magma_mode not in ("magma", "skip"):
+                raise ValueError(f"Unknown magma mode '{magma_mode}' for param {label}")
             reshape = getattr(param, "reshape", None)
             if reshape is None:
                 raise ValueError(f"NorMuon param {label} must have .reshape attribute")
@@ -490,6 +502,10 @@ class NorMuonAndAdam:
                 momentum=self.normuon_defaults["momentum"],
                 beta2=self.normuon_defaults["beta2"],
                 per_matrix_lr_mul=per_matrix_lr_mul,
+                magma_mode=magma_mode,
+                magma_p=magma_p,
+                magma_tau=magma_tau,
+                magma_ema=magma_ema,
             )
         else:
             raise ValueError(f"Unknown optim type: {optim}")
@@ -535,6 +551,10 @@ class NorMuonAndAdam:
                     second_momentum_buffer=second_momentum_buffer,
                     mantissa=mantissa,
                 )
+                if p_cfg.magma_mode is not None:
+                    self.param_states[param]["magma_s"] = torch.ones(
+                        (p_cfg.chunk_size,), dtype=torch.float32, device=param.device
+                    )
 
     # -----------------------------------
     # Reduce/Gather operations
@@ -607,6 +627,8 @@ class NorMuonAndAdam:
                 p_state["momentum_buffer"].zero_()
                 p_state["mantissa"].zero_()
                 p_state["second_momentum_buffer"].zero_()
+                if "magma_s" in p_state:
+                    p_state["magma_s"].fill_(1.0)
 
     def copy_lm_state_to_embed(self):
         """
@@ -832,8 +854,9 @@ class NorMuonAndAdam:
         momentum_buffer.lerp_(grad_chunk, 1 - p_cfg.momentum)
         updated_grads = grad_chunk.lerp_(momentum_buffer, p_cfg.momentum)
 
-        self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
-        self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
+        magma_scale = None
+        if p_cfg.magma_mode is not None:
+            magma_scale = self._compute_magma_scale(p_cfg, p_state, grad_chunk, momentum_buffer)
 
         # Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
@@ -849,22 +872,61 @@ class NorMuonAndAdam:
         param_view = param.data.view(p_cfg.reshape)
         p_slice = param_view[rank * p_cfg.chunk_size:(rank + 1) * p_cfg.chunk_size]
 
-        # MLP has per-matrix LR multipliers (c_proj gets 2x LR)
-        if p_cfg.per_matrix_lr_mul is not None:
+        if magma_scale is None:
+            self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
+            self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
+            # MLP has per-matrix LR multipliers (c_proj gets 2x LR)
+            if p_cfg.per_matrix_lr_mul is not None:
+                for mat_idx in range(p_cfg.chunk_size):
+                    self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.per_matrix_lr_mul[mat_idx] * p_cfg.lr)
+                    self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
+                    NorMuonAndAdam._cautious_wd_and_update_inplace(
+                        p_slice[mat_idx].view(torch.uint16), p_state["mantissa"][mat_idx], v_chunk[mat_idx],
+                        self._eff_wd_t, self._eff_lr_t
+                    )
+            else:
+                NorMuonAndAdam._cautious_wd_and_update_inplace(
+                    p_slice.view(torch.uint16), p_state["mantissa"], v_chunk,
+                    self._eff_wd_t, self._eff_lr_t
+                )
+        else:
+            # magma_scale is computed on GPU; move once to CPU for scalar lr factors.
+            magma_scale_cpu = magma_scale.float().cpu()
             for mat_idx in range(p_cfg.chunk_size):
-                self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.per_matrix_lr_mul[mat_idx] * p_cfg.lr)
+                scale = float(magma_scale_cpu[mat_idx])
+                if p_cfg.per_matrix_lr_mul is not None:
+                    lr_mul = p_cfg.lr_mul * p_cfg.per_matrix_lr_mul[mat_idx] * scale
+                else:
+                    lr_mul = p_cfg.lr_mul * scale
+                self._eff_lr_t.fill_(lr_mul * p_cfg.lr)
                 self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
                 NorMuonAndAdam._cautious_wd_and_update_inplace(
                     p_slice[mat_idx].view(torch.uint16), p_state["mantissa"][mat_idx], v_chunk[mat_idx],
                     self._eff_wd_t, self._eff_lr_t
                 )
-        else:
-            NorMuonAndAdam._cautious_wd_and_update_inplace(
-                p_slice.view(torch.uint16), p_state["mantissa"], v_chunk,
-                self._eff_wd_t, self._eff_lr_t
-            )
 
         return p_slice
+
+    @staticmethod
+    def _compute_magma_scale(p_cfg: ParamConfig, p_state: dict, grad_chunk: Tensor, momentum_buffer: Tensor) -> Tensor:
+        p = p_cfg.magma_p
+        if p_cfg.magma_mode == "skip":
+            mask = (torch.rand((grad_chunk.size(0),), device=grad_chunk.device) < p).to(grad_chunk.dtype)
+            return mask * (1.0 / p)
+
+        dot = (momentum_buffer * grad_chunk).sum(dim=(-2, -1))
+        mu_norm = torch.linalg.vector_norm(momentum_buffer, dim=(-2, -1))
+        g_norm = torch.linalg.vector_norm(grad_chunk, dim=(-2, -1))
+        denom = (mu_norm * g_norm).clamp_min(1e-12)
+        cossim = (dot / denom).clamp(-1.0, 1.0)
+        tilde_s = torch.sigmoid(cossim / p_cfg.magma_tau)
+
+        s_prev = p_state["magma_s"]
+        s_new = p_cfg.magma_ema * s_prev + (1.0 - p_cfg.magma_ema) * tilde_s
+        s_prev.copy_(s_new)
+
+        mask = (torch.rand_like(s_new) < p).to(s_new.dtype)
+        return s_new * mask
 
     @staticmethod
     @torch.compile(dynamic=False, fullgraph=True)
@@ -1673,8 +1735,8 @@ class TrainingManager():
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         self.param_table = {
-            "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
-            "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None, "magma": "magma"},
+            "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None, "magma": "magma"},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
@@ -1711,6 +1773,12 @@ class TrainingManager():
             weight_decay=1.2,
         )
 
+        magma_defaults = dict(
+            p=0.5,
+            tau=2.0,
+            ema=0.9,
+        )
+
         self.optimizer = NorMuonAndAdam(
             model.named_parameters(),
             param_table=self.param_table,
@@ -1718,6 +1786,7 @@ class TrainingManager():
             work_order=self.work_order,
             adam_defaults=adam_defaults,
             normuon_defaults=normuon_defaults,
+            magma_defaults=magma_defaults,
         )
 
         # Split embed from lm_head at 2/3 of training (on an odd step so Adam updates)
