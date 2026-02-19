@@ -1699,14 +1699,8 @@ class Hyperparameters:
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
     # magma / skipupdate
-    attn_base: str = "normuon"  # "normuon", "adam"
-    attn_mod: str = "none"      # "none", "magma", "skip"
-    mlp_base: str = "normuon"   # "normuon", "adam"
-    mlp_mod: str = "none"       # "none", "magma", "skip"
-    attn_mlp_adam_lr: float | None = None
-    attn_mlp_adam_wd: float | None = None
-    attn_mlp_adam_eps: float | None = None
-    attn_mlp_adam_betas: tuple[float, float] | None = None
+    lm_head_mod: str = "none"   # "none", "magma", "skip"
+    embed_mod: str = "none"     # "none", "magma", "skip"
     magma_p: float = 0.5
     magma_tau: float = 2.0
     magma_ema: float = 0.9
@@ -1714,26 +1708,15 @@ class Hyperparameters:
 def _parse_hparams() -> Hyperparameters:
     hparams = Hyperparameters()
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--attn-base", choices=["normuon", "adam"], default=None)
-    parser.add_argument("--attn-mod", choices=["none", "magma", "skip"], default=None)
-    parser.add_argument("--mlp-base", choices=["normuon", "adam"], default=None)
-    parser.add_argument("--mlp-mod", choices=["none", "magma", "skip"], default=None)
-    parser.add_argument("--attn-mlp-adam-lr", type=float, default=None)
-    parser.add_argument("--attn-mlp-adam-wd", type=float, default=None)
-    parser.add_argument("--attn-mlp-adam-eps", type=float, default=None)
-    parser.add_argument("--attn-mlp-adam-betas", type=str, default=None)
+    parser.add_argument("--lm-head-mod", choices=["none", "magma", "skip"], default=None)
+    parser.add_argument("--embed-mod", choices=["none", "magma", "skip"], default=None)
     parser.add_argument("--magma-p", type=float, default=None)
     parser.add_argument("--magma-tau", type=float, default=None)
     parser.add_argument("--magma-ema", type=float, default=None)
     parsed, _ = parser.parse_known_args()
     for key in (
-        "attn_base",
-        "attn_mod",
-        "mlp_base",
-        "mlp_mod",
-        "attn_mlp_adam_lr",
-        "attn_mlp_adam_wd",
-        "attn_mlp_adam_eps",
+        "lm_head_mod",
+        "embed_mod",
         "magma_p",
         "magma_tau",
         "magma_ema",
@@ -1741,11 +1724,6 @@ def _parse_hparams() -> Hyperparameters:
         val = getattr(parsed, key)
         if val is not None:
             setattr(hparams, key, val)
-    if parsed.attn_mlp_adam_betas is not None:
-        parts = [p.strip() for p in parsed.attn_mlp_adam_betas.split(",") if p.strip()]
-        if len(parts) != 2:
-            raise ValueError("--attn-mlp-adam-betas must be two comma-separated floats, e.g. 0.5,0.95")
-        hparams.attn_mlp_adam_betas = (float(parts[0]), float(parts[1]))
     return hparams
 
 args = _parse_hparams()
@@ -1848,7 +1826,7 @@ class TrainingManager():
     """
     Manages the NorMuonAndAdam for all parameters with explicit ordering.
         1. Scalars are given higher momentum terms to smooth learning @ChrisJMcCormick
-        2. Adam optimizers are only stepped on odd steps @classiclarryd (except attn/mlp if set to Adam base)
+        2. Adam optimizers are only stepped on odd steps @classiclarryd
         3. Explicit scatter_order and work_order for communication scheduling (no backward hooks)
         4. Muon has a linear momentum warmup and cooldown schedule
         5. Learning rates follow a linear decay schedule
@@ -1861,19 +1839,9 @@ class TrainingManager():
         # - Ordering dictates when to launch reduce/reduce_scatter operations
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
-        attn_optim = "adam" if args.attn_base == "adam" else "normuon"
-        mlp_optim = "adam" if args.mlp_base == "adam" else "normuon"
-        attn_betas = args.attn_mlp_adam_betas if attn_optim == "adam" else None
-        mlp_betas = args.attn_mlp_adam_betas if mlp_optim == "adam" else None
-        if attn_optim == "adam" and attn_betas is None:
-            attn_betas = [0.5, 0.95]
-        if mlp_optim == "adam" and mlp_betas is None:
-            mlp_betas = [0.5, 0.95]
-        attn_adam_every_step = attn_optim == "adam"
-        mlp_adam_every_step = mlp_optim == "adam"
         self.param_table = {
-            "attn":           {"optim": attn_optim, "comms": "sharded",    "adam_betas": attn_betas, "adam_every_step": attn_adam_every_step},
-            "mlp":            {"optim": mlp_optim, "comms": "sharded",    "adam_betas": mlp_betas, "adam_every_step": mlp_adam_every_step},
+            "attn":           {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "mlp":            {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
@@ -1885,25 +1853,11 @@ class TrainingManager():
             "value_embed":    {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
         }
-        if attn_optim == "adam":
-            if args.attn_mlp_adam_lr is not None:
-                self.param_table["attn"]["adam_lr"] = args.attn_mlp_adam_lr
-            if args.attn_mlp_adam_wd is not None:
-                self.param_table["attn"]["adam_weight_decay"] = args.attn_mlp_adam_wd
-            if args.attn_mlp_adam_eps is not None:
-                self.param_table["attn"]["adam_eps"] = args.attn_mlp_adam_eps
-        if mlp_optim == "adam":
-            if args.attn_mlp_adam_lr is not None:
-                self.param_table["mlp"]["adam_lr"] = args.attn_mlp_adam_lr
-            if args.attn_mlp_adam_wd is not None:
-                self.param_table["mlp"]["adam_weight_decay"] = args.attn_mlp_adam_wd
-            if args.attn_mlp_adam_eps is not None:
-                self.param_table["mlp"]["adam_eps"] = args.attn_mlp_adam_eps
 
-        if args.attn_mod in ("magma", "skip"):
-            self.param_table["attn"]["magma"] = args.attn_mod
-        if args.mlp_mod in ("magma", "skip"):
-            self.param_table["mlp"]["magma"] = args.mlp_mod
+        if args.lm_head_mod in ("magma", "skip"):
+            self.param_table["lm_head"]["magma"] = args.lm_head_mod
+        if args.embed_mod in ("magma", "skip"):
+            self.param_table["embed"]["magma"] = args.embed_mod
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
@@ -2091,10 +2045,7 @@ print0(nvidia_smi())
 print0("="*100)
 print0(
     "Optimizer settings: "
-    f"attn_base={args.attn_base}, attn_mod={args.attn_mod}, "
-    f"mlp_base={args.mlp_base}, mlp_mod={args.mlp_mod}, "
-    f"attn_mlp_adam_lr={args.attn_mlp_adam_lr}, attn_mlp_adam_wd={args.attn_mlp_adam_wd}, "
-    f"attn_mlp_adam_eps={args.attn_mlp_adam_eps}, attn_mlp_adam_betas={args.attn_mlp_adam_betas}, "
+    f"lm_head_mod={args.lm_head_mod}, embed_mod={args.embed_mod}, "
     f"magma_p={args.magma_p}, magma_tau={args.magma_tau}, magma_ema={args.magma_ema}",
     console=True,
 )
